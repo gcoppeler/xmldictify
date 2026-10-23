@@ -39,4 +39,4 @@ def test_postprocessor_receives_path():
         return key, value
 
     x.parse("<a><b><c>1</c></b></a>", postprocessor=pp)
-    assert ("a", "b") in seen_paths
+    assert [("a", None), ("b", None)] in seen_paths

@@ -61,6 +61,7 @@ def test_generator_of_chunks_input():
 
 def test_malformed_xml_raises():
     import pytest
+    from xml.parsers.expat import ExpatError
 
-    with pytest.raises(x.XMLParseError):
+    with pytest.raises(ExpatError):
         x.parse("<a><b></a>")

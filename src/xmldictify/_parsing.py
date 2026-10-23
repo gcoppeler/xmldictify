@@ -1,20 +1,34 @@
-"""XML -> dict parsing, built directly on xml.parsers.expat."""
+"""XML -> dict parsing, built directly on xml.parsers.expat.
+
+Depth and path conventions (our own design, verified against the
+documented/tested behavior of comparable libraries):
+
+* The root element is depth 1; each nested level adds 1.
+* ``path`` arguments are lists of ``(tag, attrs_or_None)`` tuples, where
+  ``attrs_or_None`` is a plain dict of raw (unprefixed) attribute names to
+  string values, or ``None`` if the element had no attributes.
+* For ``force_list``/``force_cdata`` and the "attach this child to its
+  parent" postprocessor call, ``path`` is the *container's own* chain
+  (ancestors of the container, plus the container itself as the last
+  entry) -- i.e. it does not include the child's own tag, since the
+  child's tag is already passed separately as ``key``.
+* For the per-attribute and per-text-key (``cdata_key``) postprocessor
+  calls, and for ``item_callback``, ``path`` includes the current
+  element's own tag as the last entry (it *is* the container for its own
+  attributes/text, or the subject being reported).
+"""
 
 from __future__ import annotations
 
+import xml.parsers.expat as _default_expat
 from typing import Any, Callable, Iterable, Optional, Union
-from xml.parsers import expat
 
-from ._errors import EntitiesForbidden, XMLParseError
+from ._errors import EntitiesForbidden, ParsingInterrupted
 
 _CHUNK_SIZE = 64 * 1024
 
-Predicate = Callable[[tuple, str, Any], bool]
+Predicate = Callable[[list, str, Any], bool]
 PathKeyValue = Union[bool, Iterable[str], Predicate, None]
-
-
-class _StopParsing(Exception):
-    """Internal sentinel raised to unwind expat when item_callback returns False."""
 
 
 def _make_predicate(spec: PathKeyValue) -> Predicate:
@@ -29,13 +43,14 @@ def _make_predicate(spec: PathKeyValue) -> Predicate:
 
 
 class _Frame:
-    __slots__ = ("tag", "path", "data", "text_parts")
+    __slots__ = ("tag", "path", "raw_attrs", "data", "text_parts")
 
-    def __init__(self, tag: str, path: tuple, dict_constructor):
+    def __init__(self, tag: str, path: list, dict_constructor):
         self.tag = tag
         self.path = path
+        self.raw_attrs: Optional[dict] = None
         self.data = dict_constructor()
-        self.text_parts: list[str] = []
+        self.text_parts: list = []
 
 
 class _SaxToDict:
@@ -74,10 +89,12 @@ class _SaxToDict:
         self.dict_constructor = dict_constructor
         self.process_namespaces = process_namespaces
         self.namespace_separator = namespace_separator
-        self.namespaces = namespaces or {}
+        self.namespaces = namespaces if namespaces is not None else {}
 
         self.stack: list[_Frame] = []
         self.result = None
+        self._pending_ns: dict = {}
+        self._toplevel_comments: list = []
 
     # -- namespace resolution -------------------------------------------------
 
@@ -88,14 +105,22 @@ class _SaxToDict:
         if sep not in raw_name:
             return raw_name
         uri, local = raw_name.rsplit(sep, 1)
-        if uri in self.namespaces:
+        try:
             prefix = self.namespaces[uri]
-            return local if prefix is None else f"{prefix}:{local}"
-        return raw_name
+        except KeyError:
+            return raw_name
+        return local if not prefix else f"{prefix}:{local}"
+
+    # -- postprocessor helper ---------------------------------------------------
+
+    def _pp(self, path: list, key: str, value: Any):
+        if self.postprocessor is None:
+            return key, value
+        return self.postprocessor(path, key, value)
 
     # -- list/child attachment -------------------------------------------------
 
-    def _add_child(self, container, path: tuple, key: str, value: Any) -> None:
+    def _add_child(self, container, path: list, key: str, value: Any) -> None:
         if key in container:
             existing = container[key]
             if isinstance(existing, list):
@@ -109,14 +134,34 @@ class _SaxToDict:
 
     # -- expat handlers ---------------------------------------------------------
 
+    def start_ns(self, prefix: Optional[str], uri: str) -> None:
+        self._pending_ns[prefix or ""] = uri
+
     def start_element(self, raw_name: str, raw_attrs: dict) -> None:
         tag = self._resolve_name(raw_name)
-        path = tuple(f.tag for f in self.stack)
+        path = [(f.tag, f.raw_attrs) for f in self.stack]
         frame = _Frame(tag, path, self.dict_constructor)
+
+        raw_attrs_dict = {}
         if self.xml_attribs:
             for raw_key, value in raw_attrs.items():
-                key = self.attr_prefix + self._resolve_name(raw_key)
+                raw_attrs_dict[self._resolve_name(raw_key)] = value
+        frame.raw_attrs = raw_attrs_dict or None
+
+        if self.xml_attribs and raw_attrs_dict:
+            self_chain = path + [(tag, frame.raw_attrs)]
+            for name, value in raw_attrs_dict.items():
+                result = self._pp(self_chain, self.attr_prefix + name, value)
+                if result is None:
+                    continue
+                key, value = result
                 frame.data[key] = value
+
+        if self._pending_ns:
+            if self.xml_attribs:
+                frame.data[self.attr_prefix + "xmlns"] = dict(self._pending_ns)
+            self._pending_ns = {}
+
         self.stack.append(frame)
 
     def char_data(self, data: str) -> None:
@@ -124,75 +169,68 @@ class _SaxToDict:
             self.stack[-1].text_parts.append(data)
 
     def comment(self, data: str) -> None:
-        if not self.process_comments or not self.stack:
+        if not self.process_comments:
             return
         text = data.strip() if self.strip_whitespace else data
+        if not self.stack:
+            self._toplevel_comments.append(text)
+            return
         frame = self.stack[-1]
-        self._add_child(frame.data, frame.path, self.comment_key, text)
+        self._add_child(frame.data, frame.path + [(frame.tag, frame.raw_attrs)], self.comment_key, text)
 
     def end_element(self, raw_name: str) -> None:
         frame = self.stack.pop()
-        value = self._finalize(frame)
+        parent_chain = [(f.tag, f.raw_attrs) for f in self.stack]
+        value = self._finalize(frame, parent_chain)
 
-        if self.postprocessor is not None:
-            result = self.postprocessor(frame.path, frame.tag, value)
-            if result is None:
-                return
-            key, value = result
-        else:
-            key = frame.tag
+        result = self._pp(parent_chain, frame.tag, value)
+        if result is None:
+            return
+        key, value = result
 
-        if not self.stack:
-            self._finish_root(frame.path, key, value)
+        if self.item_depth == 0:
+            if self.stack:
+                self._add_child(self.stack[-1].data, parent_chain, key, value)
+            else:
+                wrapped = self.dict_constructor()
+                self._add_child(wrapped, parent_chain, key, value)
+                self.result = wrapped
             return
 
-        self._dispatch(frame.path, key, value)
+        depth = len(self.stack) + 1
+        if depth == self.item_depth:
+            self_chain = frame.path + [(frame.tag, frame.raw_attrs)]
+            if self.item_callback(self_chain, value) is False:
+                raise ParsingInterrupted("item_callback returned False")
+            return
+        if depth < self.item_depth:
+            return
+        self._add_child(self.stack[-1].data, parent_chain, key, value)
 
     # -- value construction -----------------------------------------------------
 
-    def _finalize(self, frame: _Frame) -> Any:
+    def _finalize(self, frame: _Frame, parent_chain: list) -> Any:
         raw_text = self.cdata_separator.join(frame.text_parts)
         text = raw_text.strip() if self.strip_whitespace else raw_text
         has_text = bool(text)
 
         if frame.data:
             if has_text:
-                frame.data[self.cdata_key] = text
+                self_chain = frame.path + [(frame.tag, frame.raw_attrs)]
+                result = self._pp(self_chain, self.cdata_key, text)
+                if result is not None:
+                    key, value = result
+                    frame.data[key] = value
             return frame.data
 
         if not has_text:
             return None
 
-        if self.force_cdata(frame.path, frame.tag, text):
+        if self.force_cdata(parent_chain, frame.tag, text):
             wrapped = self.dict_constructor()
             wrapped[self.cdata_key] = text
             return wrapped
         return text
-
-    # -- attachment / streaming dispatch ----------------------------------------
-
-    def _dispatch(self, path: tuple, key: str, value: Any) -> None:
-        depth = len(self.stack)  # depth of the child that just finished
-
-        if self.item_depth:
-            if depth == self.item_depth:
-                if self.item_callback(path, value) is False:
-                    raise _StopParsing()
-                return
-            if depth < self.item_depth:
-                return
-
-        self._add_child(self.stack[-1].data, self.stack[-1].path, key, value)
-
-    def _finish_root(self, path: tuple, key: str, value: Any) -> None:
-        if self.item_depth:
-            # Streaming mode: the root carries no retained value.
-            self.result = None
-            return
-        wrapped = self.dict_constructor()
-        wrapped[key] = value
-        self.result = wrapped
-        self.item_callback((), wrapped)
 
 
 def parse(
@@ -213,27 +251,27 @@ def parse(
     comment_key: str = "#comment",
     force_list: PathKeyValue = None,
     item_depth: int = 0,
-    item_callback: Callable[[tuple, Any], Any] = lambda *args: True,
-    postprocessor: Optional[Callable[[tuple, str, Any], Any]] = None,
+    item_callback: Callable[[list, Any], Any] = lambda *args: True,
+    postprocessor: Optional[Callable[[list, str, Any], Any]] = None,
     dict_constructor=dict,
+    expat=_default_expat,
 ):
     """Parse XML into a dict.
 
     ``xml_input`` may be a ``str``, ``bytes``, a file-like object (anything
     with a ``.read()`` method), or an iterable of ``str``/``bytes`` chunks.
 
-    When ``item_depth`` is 0 (the default), the whole document is parsed and
-    returned as a single dict/scalar tree. When ``item_depth`` is greater
-    than 0, parsing runs in streaming mode: every subtree found at that
-    depth (root = depth 0) is handed to ``item_callback(path, item)`` and
-    then discarded rather than retained, so arbitrarily large documents can
-    be processed in bounded memory; ``parse()`` itself returns ``None`` in
-    that mode. Returning ``False`` from ``item_callback`` stops parsing
-    early (no exception is raised).
+    The root element is depth 1. When ``item_depth`` is 0 (the default),
+    the whole document is parsed and returned as a dict. When
+    ``item_depth`` is greater than 0, parsing runs in streaming mode:
+    every subtree found at that depth is handed to
+    ``item_callback(path, item)`` and discarded rather than retained, so
+    arbitrarily large documents can be processed in bounded memory;
+    ``parse()`` itself returns ``None`` in that mode. Returning ``False``
+    from ``item_callback`` raises :class:`ParsingInterrupted`.
 
-    ``path`` arguments passed to ``force_list``, ``force_cdata``,
-    ``postprocessor`` and ``item_callback`` are tuples of ancestor tag
-    names (not including the element's own tag).
+    ``expat`` is pluggable: pass an object exposing ``ParserCreate`` (and,
+    typically, ``ExpatError``) to use an alternate implementation.
     """
     handler = _SaxToDict(
         xml_attribs=xml_attribs,
@@ -264,31 +302,29 @@ def parse(
     parser.CharacterDataHandler = handler.char_data
     if process_comments:
         parser.CommentHandler = handler.comment
+    if process_namespaces:
+        parser.StartNamespaceDeclHandler = handler.start_ns
 
     if disable_entities:
         def _forbid(*_args, **_kwargs):
             raise EntitiesForbidden(
-                "DOCTYPE declarations and entities are disabled "
-                "(pass disable_entities=False to allow them)"
+                "entities are disabled (pass disable_entities=False to allow them)"
             )
 
         def _forbid_external(*_args, **_kwargs):
             raise EntitiesForbidden(
-                "External entity references are disabled "
-                "(pass disable_entities=False to allow them)"
+                "external entities are disabled (pass disable_entities=False to allow them)"
             )
 
-        parser.StartDoctypeDeclHandler = _forbid
         parser.EntityDeclHandler = _forbid
         parser.UnparsedEntityDeclHandler = _forbid
         parser.ExternalEntityRefHandler = _forbid_external
 
-    try:
-        _feed(parser, xml_input)
-    except _StopParsing:
-        pass
-    except expat.ExpatError as exc:
-        raise XMLParseError(str(exc)) from exc
+    _feed(parser, xml_input)
+
+    if handler.item_depth == 0 and handler.result is not None:
+        for text in handler._toplevel_comments:
+            handler._add_child(handler.result, [], comment_key, text)
 
     return handler.result
 

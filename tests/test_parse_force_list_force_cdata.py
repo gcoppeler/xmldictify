@@ -9,8 +9,9 @@ def test_force_list_by_tag_name():
 
 
 def test_force_list_true_forces_everything():
+    # force_list=True applies even to the root element itself.
     result = x.parse(XML, force_list=True)
-    assert result == {"a": {"b": ["data1", "data2"], "c": ["data3"]}}
+    assert result == {"a": [{"b": ["data1", "data2"], "c": ["data3"]}]}
 
 
 def test_force_list_callable():

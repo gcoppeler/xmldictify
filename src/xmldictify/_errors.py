@@ -7,12 +7,12 @@ class XMLToDictError(Exception):
     """Base class for all errors raised by xmldictify."""
 
 
-class XMLParseError(XMLToDictError):
-    """The input could not be parsed as well-formed XML."""
+class ParsingInterrupted(XMLToDictError):
+    """Raised when a streaming item_callback returns False."""
 
 
-class EntitiesForbidden(XMLParseError):
-    """The document declared a DOCTYPE/entity while disable_entities=True."""
+class EntitiesForbidden(XMLToDictError, ValueError):
+    """The document declared/used an entity while disable_entities=True."""
 
 
 class MultipleRootsError(XMLToDictError, ValueError):

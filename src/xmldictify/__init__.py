@@ -5,7 +5,7 @@ from ._errors import (
     InvalidRootValueError,
     InvalidXMLNameError,
     MultipleRootsError,
-    XMLParseError,
+    ParsingInterrupted,
     XMLToDictError,
 )
 from ._parsing import parse
@@ -17,7 +17,7 @@ __all__ = [
     "parse",
     "unparse",
     "XMLToDictError",
-    "XMLParseError",
+    "ParsingInterrupted",
     "EntitiesForbidden",
     "MultipleRootsError",
     "InvalidRootValueError",

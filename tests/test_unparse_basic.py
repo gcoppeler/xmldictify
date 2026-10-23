@@ -2,7 +2,8 @@ import xmldictify as x
 
 
 def test_simple_root():
-    assert x.unparse({"a": "text"}) == '<?xml version="1.0" encoding="utf-8"?><a>text</a>'
+    # The declaration is always followed by a literal newline.
+    assert x.unparse({"a": "text"}) == '<?xml version="1.0" encoding="utf-8"?>\n<a>text</a>'
 
 
 def test_full_document_false_omits_declaration():
@@ -52,7 +53,9 @@ def test_attr_escaping_includes_whitespace_chars():
 
 def test_scalar_coercion():
     assert x.unparse({"a": 42}, full_document=False) == "<a>42</a>"
-    assert x.unparse({"a": True}, full_document=False) == "<a>True</a>"
+    # Booleans coerce to lowercase "true"/"false", not Python's str(bool).
+    assert x.unparse({"a": True}, full_document=False) == "<a>true</a>"
+    assert x.unparse({"a": False}, full_document=False) == "<a>false</a>"
 
 
 def test_custom_attr_prefix_and_cdata_key():
